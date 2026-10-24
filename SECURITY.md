@@ -16,9 +16,9 @@ manually reviewed excerpt instead.
 
 ## Administrator authorization
 
-The front door uses normal `sudo` in an interactive terminal. When an
-automation process has no terminal, it invokes `scripts/macos-sudo-askpass`,
-which presents a hidden-input AppleScript dialog in the logged-in macOS GUI.
+The front door authorizes one fixed-purpose worker through `sudo -A` before
+unmounting. `scripts/macos-sudo-askpass` presents a hidden-input AppleScript
+dialog in the logged-in macOS GUI. No reusable sudo timestamp is assumed.
 The helper's standard output is connected directly to `sudo`'s credential
 reader. It does not write the password to disk, print it to the calling process
 or place it in a command-line argument or environment variable.
@@ -46,3 +46,17 @@ This project is not a recovery, repair, firmware, or destructive-diagnostics
 tool. It implements only data-in identity and health commands. A clean SMART
 reading does not guarantee that a drive will not fail; maintain independent,
 tested backups.
+
+## Recovery boundary
+
+Only a worker acknowledgement after native-child reaping permits restoration.
+The release marker is evidence that the cleanup path returned, not proof that
+macOS recovered the hardware. Recovery verifies the original volume manifest.
+Uncertain mutation completion or missing ownership acknowledgement retains the
+capture lock and requires operator inspection. SIGKILL, power loss, hostile
+modification of the authorized checkout, and a stuck kernel/driver are outside
+the guarantee. Keep the checkout and Python installation trusted and on internal
+storage; the worker executes code from that checkout with administrator rights.
+
+The regression fixtures contain synthetic identifiers only. They do not establish
+real-device compatibility or validate kernel behavior.

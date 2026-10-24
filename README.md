@@ -4,7 +4,7 @@
 when Disk Utility reports `SMART Status: Not Supported`.**
 
 RTL9210 Health Monitor is a small, read-only macOS evidence collector for an
-NVMe SSD hidden behind a Realtek RTL9210 USB bridge. It safely arbitrates the
+NVMe SSD hidden behind a Realtek RTL9210 USB bridge. It temporarily arbitrates the
 USB device away from macOS, reads the controller identity, SMART/Health log and
 Error Information log, then returns the disk to macOS and verifies that its
 APFS volume remounted from the expected physical store.
@@ -30,14 +30,25 @@ variants, endpoint layouts and firmware behaviors have not all been tested.
 Enrollment fails closed unless the selected disk identifies as RTL9210 and
 exactly one `0bda:9210` bridge is attached.
 
+This branch adds macOS 15 build compatibility and stricter capture/recovery
+supervision. One explicitly authorized enrollment capture has completed on
+Apple silicon and macOS 15 with an RTL9210 bridge, including normal unmount,
+identity/health/error-log reads, native release, and verified restoration of
+APFS and exFAT volumes. This is one successful hardware run, not universal
+compatibility or hardware validation of every cancellation/failure path. Those
+paths remain covered by offline simulation; keep this patch under review.
+
 ## Quick start
 
 Requirements:
 
-- macOS and an administrator account;
+- Apple silicon, macOS 15 or later, and an administrator account;
+- Python 3.9+ installed on internal storage;
 - Xcode Command Line Tools;
 - one RTL9210 enclosure connected, with other RTL9210 devices disconnected;
-- one mounted, unlocked APFS volume on the target disk;
+- one mounted, unlocked APFS volume on the target disk for enrollment;
+- all target data volumes mounted and unlocked under `/Volumes/`;
+- the checkout, output directory, Python and its runtime on internal storage;
 - Time Machine and every other workload on that disk idle;
 - another copy of important data.
 
@@ -64,8 +75,8 @@ For an automation agent that has already proved the exact targets with
   --confirm
 ```
 
-If no terminal is attached, macOS displays a local administrator-password
-dialog. The bundled helper sends that password directly to `sudo`; it does not
+Capture authorization uses a local macOS administrator-password dialog
+through `sudo -A` (a logged-in GUI session is required). The bundled helper sends that password directly to `sudo`; it does not
 return the credential to the calling agent, print it or store it. Existing
 profiles still require explicit `--replace` to be overwritten.
 
@@ -78,7 +89,7 @@ Setup is an interactive, trust-on-first-use operation. It:
 5. requires typed `ENROLL` confirmation;
 6. unmounts the whole disk and captures exactly one `0bda:9210` bridge;
 7. reads the bridge and underlying NVMe identities plus health pages;
-8. restores the macOS storage driver, remounts the disk and verifies APFS;
+8. releases USB capture, requests remount, and verifies all original volumes;
 9. writes exact identities to `config/device.plist` with mode `600`.
 
 `config/device.plist` and all controller captures are gitignored. Do not
@@ -103,7 +114,7 @@ send a controller command.
 
 The probe waits for typed `PROBE` confirmation and administrator authority. It
 then briefly unmounts the enrolled disk, reads three NVMe pages, restores the
-device and verifies that the enrolled APFS volume remounted.
+device and verifies the original set of mounted volumes.
 
 An automation agent can use:
 
@@ -119,6 +130,43 @@ Do **not** run `.build/rtl9210_health_probe` directly. The front door owns the
 Time Machine preflight, disk-to-volume proof, confirmation, cleanup trap and
 post-remount verification.
 
+## Capture and recovery lifecycle
+
+The front door takes an exclusive `.capture-lock`, verifies internal dependency
+storage, snapshots all target volumes, and binds the selected BSD disk to its
+actual USB registry entry. Volume names and counts are discovered; no device
+serial, label or disk number is built in. Enrollment still requires an APFS
+anchor and the supported single-store RTL9210 topology. Other filesystems may
+coexist on that disk, but every captured volume needs a stable UUID. Locked or
+unmounted data volumes are rejected before any mutation. EFI support partitions
+are excluded from that requirement.
+
+The profile location is fixed at `config/device.plist`; the former
+`RTL9210_HEALTH_CONFIG` override is no longer accepted, so an external profile
+cannot become unavailable midway through capture.
+
+One authorized worker starts **before** unmount and owns the native child for
+its entire lifetime. It handles cancellation and reaping with the same privilege
+as the child, then returns ownership of private outputs. An unprivileged shell
+never tries to kill a root child through a `sudo` monitor. Signals set a native
+cancellation flag; USB cleanup occurs in normal execution context. Native release
+completion and successful filesystem restoration are separate checks.
+
+A timed-out or failed `diskutil` mutation may still leave asynchronous Disk
+Arbitration work in progress. Such an outcome retains the lock and blocks further
+mutations; merely observing a CLI exit or a mounted volume is insufficient.
+Recovery waits for exact volume identities, then verifies every original UUID,
+name, path, filesystem and physical store before publishing `latest`. Critical
+output goes to an internal transaction log, so a stalled terminal reader cannot
+hold up recovery.
+
+Exit status 70 indicates unconfirmed recovery. Do not retry capture or delete the
+lock without inspecting the prior run and actual device state. No force mount,
+repair, formatting or automatic lock expiry is implemented. An uncatchable shell
+termination, kernel hang, power loss or physical disconnection cannot be repaired
+by an EXIT trap; the worker can release its child but cannot guarantee remount
+without the front door. A retained lock is intentional in uncertain cases.
+
 ## Private outputs
 
 A successful run is stored locally under `runs/YYYYMMDD_HHMMSS/`:
@@ -133,7 +181,8 @@ runs/20260101_120000/
 └── SHA256SUMS                # integrity hashes for captured artifacts
 ```
 
-Enrollment runs also contain `enrollment.plist`, which is private. `latest`
+Runs also contain private volume manifests, process acknowledgements, release
+status, mutation receipts and a transaction log. Enrollment runs also contain `enrollment.plist`, which is private. `latest`
 points to the newest successful run. Failed runs are retained for local
 diagnosis but never replace `latest`.
 
@@ -231,7 +280,7 @@ Routine probes fail unless all of these agree:
 - every USB transfer has the exact expected length;
 - every BOT Command Status Wrapper has the expected signature and command tag,
   success status and zero residue;
-- the enrolled volume remounts from the expected physical disk afterward.
+- every originally mounted volume remounts with matching identity and path afterward.
 
 The native probe implements only data-in commands:
 
@@ -303,7 +352,7 @@ entrypoints:
   - ./rtl9210-health status
   - ./rtl9210-health probe  # interactive confirmation
   - ./rtl9210-health probe --confirm  # agent/non-interactive confirmation
-authorization: terminal sudo when interactive; local macOS dialog otherwise
+authorization: single sudo -A worker with local macOS dialog
 private_paths:
   - config/device.plist
   - runs/
@@ -312,6 +361,7 @@ never_add: data-out, firmware, format, sanitize, self-test, namespace commands
 ```
 
 See [AGENTS.md](AGENTS.md) for mandatory modification and verification rules.
+See [tests/README.md](tests/README.md) for hardware-free validation and its limits.
 
 ## Project layout
 

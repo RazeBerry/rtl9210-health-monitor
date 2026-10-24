@@ -1,12 +1,60 @@
 #!/bin/bash
 set -euo pipefail
+umask 077
 
-ROOT=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$(dirname "$0")" && pwd -P)
 SOURCE="$ROOT/src/rtl9210_health_probe.m"
 BINARY="$ROOT/.build/rtl9210_health_probe"
 RUNS="$ROOT/runs"
-CONFIG_PATH=${RTL9210_HEALTH_CONFIG:-"$ROOT/config/device.plist"}
+CONFIG_PATH="$ROOT/config/device.plist"
 ASKPASS="$ROOT/scripts/macos-sudo-askpass"
+VOLUME_GUARD="$ROOT/scripts/volume_guard.py"
+PYTHON=""
+VOLUME_MANIFEST=""
+LOCK_HELD=0
+
+BOUNDED="$ROOT/scripts/bounded.py"
+PROBE_RECEIPT=""
+PROBE_PENDING=0
+MUTATION_PENDING=0
+MUTATION_RECEIPT=""
+RECOVERY_FAILED=0
+CAPTURE_LOG=""
+WORKER_DIR=""
+WORKER_STARTED=0
+WORKER_LAUNCH_PID=0
+WORKER_CLIENT_PID=0
+
+bounded() { "$PYTHON" -I "$BOUNDED" "$1" - "${@:2}"; }
+diskutil() { bounded 20 /usr/sbin/diskutil "$@"; }
+mutate_disk() {
+    local result=0
+    MUTATION_RECEIPT="$LAST_OPERATION_DIR/$1-exited"
+    MUTATION_PENDING=1
+    "$PYTHON" -I "$BOUNDED" 25 "$MUTATION_RECEIPT" /usr/sbin/diskutil "$@" || result=$?
+    if ! "$PYTHON" -I "$BOUNDED" --check-complete "$MUTATION_RECEIPT"; then
+        RECOVERY_FAILED=1
+        return 125
+    fi
+    MUTATION_PENDING=0
+    return "$result"
+}
+LAST_OPERATION_DIR=""
+
+
+capture_preflight() {
+    PYTHON=$(command -v python3) || die "Python 3.9+ required"
+    # Resolve the interpreter without importing any project code.
+    PYTHON=$("$PYTHON" -I -c 'import os,sys; print(os.path.realpath(sys.executable))')
+    [[ ! -L "$ROOT/scripts" && ! -L "$ROOT/scripts/storage_guard.py" ]] || die "symlinked preflight helper"
+    "$PYTHON" -I "$ROOT/scripts/storage_guard.py" "$ROOT" || die "internal storage preflight failed"
+    if ! mkdir "$ROOT/.capture-lock" 2>/dev/null; then
+        die "capture lock exists; inspect prior capture before removing it manually"
+    fi
+    LOCK_HELD=1
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM HUP
+}
 
 # Public Realtek bridge identity used only for first-time enrollment.
 ENROLL_USB_VID="0x0bda"
@@ -96,7 +144,7 @@ resolve_disk() {
     local matches=()
     while read -r candidate _; do
         [[ "$candidate" =~ ^/dev/disk[0-9]+$ ]] || continue
-        info=$(/usr/sbin/diskutil info -plist "$candidate" 2>/dev/null) || continue
+        info=$(diskutil info -plist "$candidate" 2>/dev/null) || continue
         media=$(plist_stdin_value "$info" MediaName 2>/dev/null || true)
         size=$(plist_stdin_value "$info" IOKitSize 2>/dev/null || true)
         protocol=$(plist_stdin_value "$info" BusProtocol 2>/dev/null || true)
@@ -106,7 +154,7 @@ resolve_disk() {
               "$protocol" == "USB" && "$whole" == "true" ]]; then
             matches+=("$candidate")
         fi
-    done < <(/usr/sbin/diskutil list external physical)
+    done < <(diskutil list external physical)
 
     [[ ${#matches[@]} -eq 1 ]] ||
         die "expected one enrolled RTL9210 disk; found ${#matches[@]}"
@@ -115,7 +163,7 @@ resolve_disk() {
 
 mounted_volume_matches() {
     local disk=$1 info mount store disk_name
-    info=$(/usr/sbin/diskutil info -plist "$EXPECTED_VOLUME_UUID" 2>/dev/null) ||
+    info=$(diskutil info -plist "$EXPECTED_VOLUME_UUID" 2>/dev/null) ||
         return 1
     mount=$(plist_stdin_value "$info" MountPoint 2>/dev/null) || return 1
     store=$(plist_stdin_value "$info" APFSPhysicalStores.0.APFSPhysicalStore \
@@ -144,7 +192,7 @@ wait_for_mounted_volume() {
 
 time_machine_state() {
     local output state
-    output=$(/usr/bin/tmutil status) ||
+    output=$(bounded 15 /usr/bin/tmutil status) ||
         die "could not establish Time Machine state"
     state=$(printf '%s\n' "$output" | /usr/bin/awk -F'= ' \
         '/Running/{gsub(/[; ]/,"",$2); print $2; exit}')
@@ -163,44 +211,65 @@ require_time_machine_idle() {
 }
 
 build_if_needed() {
+    [[ "$ROOT" != /Volumes/* ]] || die "store tool on internal disk before building"
     mkdir -p "$ROOT/.build"
-    if [[ ! -x "$BINARY" || "$SOURCE" -nt "$BINARY" ]]; then
+    if [[ ! -x "$BINARY" || "$SOURCE" -nt "$BINARY" || "$ROOT/src/cancellation.h" -nt "$BINARY" ]]; then
         printf 'Building native probe…\n'
-        /usr/bin/xcrun clang -fobjc-arc -Wall -Wextra -Werror \
+        /usr/bin/xcrun clang -arch arm64 -mmacosx-version-min=15.0 -fobjc-arc -Wall -Wextra -Werror \
             -framework Foundation -framework IOKit -framework IOUSBHost \
             "$SOURCE" -o "$BINARY"
     fi
 }
 
-USE_ASKPASS=0
-
-authorize_admin() {
-    if /usr/bin/sudo -n true >/dev/null 2>&1; then
-        return 0
-    fi
-    if [[ -t 0 && -t 1 ]]; then
-        /usr/bin/sudo -v
-        return 0
-    fi
-
-    [[ -x "$ASKPASS" ]] || die "macOS authorization helper is unavailable"
-    USE_ASKPASS=1
-    SUDO_ASKPASS="$ASKPASS" /usr/bin/sudo -A -v
+wait_worker() {
+    local mode=$1 seconds=$2 result=0
+    "$PYTHON" -I "$ROOT/scripts/worker_client.py" "$mode" "$WORKER_DIR" "$seconds" "$WORKER_LAUNCH_PID" &
+    WORKER_CLIENT_PID=$!
+    # Bash wait is interruptible; a foreground external command would defer traps.
+    wait "$WORKER_CLIENT_PID" || result=$?
+    WORKER_CLIENT_PID=0
+    return "$result"
 }
 
-run_as_root() {
-    if [[ $USE_ASKPASS -eq 1 ]]; then
-        SUDO_ASKPASS="$ASKPASS" /usr/bin/sudo -A "$@"
-    else
-        /usr/bin/sudo "$@"
+start_worker() {
+    local mode=$1 disk=$2 binding=$3 directory=$4
+    [[ -x "$ASKPASS" ]] || die "macOS authorization helper is unavailable"
+    WORKER_DIR=$directory
+    WORKER_STARTED=1
+    # Authorize the actual worker once. No cached authorization is transferred
+    # across sessions, and no later sudo invocation occurs after unmount.
+    # Intentionally keep the launcher log owned/opened by the unprivileged caller.
+    # shellcheck disable=SC2024
+    SUDO_ASKPASS="$ASKPASS" /usr/bin/sudo -A "$PYTHON" -I "$ROOT/scripts/privileged_worker.py" \
+        "$ROOT" "$directory" "$mode" "$disk" "$binding" "$ENROLL_USB_VID" "$ENROLL_USB_PID" \
+        "$UID" "$(/usr/bin/id -g)" "$$" >> "$directory/worker.log" 2>&1 &
+    WORKER_LAUNCH_PID=$!
+    wait_worker ready 90 ||
+        die "authorized worker handshake failed; no unmount attempted"
+}
+
+settle_worker() {
+    [[ $WORKER_STARTED -eq 1 ]] || return 0
+    : > "$WORKER_DIR/cancel.request"
+    if [[ $WORKER_CLIENT_PID -gt 0 ]]; then
+        # Only our unprivileged waiting client is signalled, never sudo/root processes.
+        kill -TERM "$WORKER_CLIENT_PID" 2>/dev/null || true
+        wait "$WORKER_CLIENT_PID" 2>/dev/null || true
+        WORKER_CLIENT_PID=0
     fi
+    if ! wait_worker "done" 170; then
+        RECOVERY_FAILED=1
+        return 1
+    fi
+    WORKER_STARTED=0
+    PROBE_PENDING=0  # Actual privileged owner confirmed no native child remains.
 }
 
 show_status() {
     local disk info used free latest_health tm_state
     disk=$(resolve_disk)
     verify_mounted_volume "$disk"
-    info=$(/usr/sbin/diskutil info -plist "$EXPECTED_VOLUME_UUID")
+    info=$(diskutil info -plist "$EXPECTED_VOLUME_UUID")
     used=$(plist_stdin_value "$info" CapacityInUse)
     free=$(plist_stdin_value "$info" APFSContainerFree)
 
@@ -220,34 +289,73 @@ show_status() {
 }
 
 NEEDS_RESTORE=0
-ACTIVE_DISK=""
 
 restore_disk() {
-    local disk=""
+    local disk="" identity_rc ready=0 deadline=$((SECONDS + 90))
     [[ $NEEDS_RESTORE -eq 1 ]] || return 0
-    # Clear first so an unexpected shell error cannot trigger a second reset.
-    # Post-capture identity verification remains responsible for failing the run.
+    # Mark incomplete BEFORE clearing the pending flag: signals can arrive between commands.
+    RECOVERY_FAILED=1
     NEEDS_RESTORE=0
-    printf '\nRestoring the disk to macOS…\n' >&2
-    for _ in {1..15}; do
-        if disk=$(resolve_disk 2>/dev/null); then
-            break
+    if [[ $MUTATION_PENDING -eq 1 ]] && ! "$PYTHON" -I "$BOUNDED" --check-complete "$MUTATION_RECEIPT"; then
+        printf 'RECOVERY BLOCKED: disk operation completion is ambiguous; no additional mutation.\n' >&2
+        return 1
+    fi
+    if [[ $PROBE_PENDING -eq 1 && ! -f "$PROBE_RECEIPT" ]]; then
+        printf 'RECOVERY BLOCKED: probe exit unconfirmed; retaining lock, no mount attempted.\n' >&2
+        RECOVERY_FAILED=1
+        return 1
+    fi
+    PROBE_PENDING=0
+    MUTATION_PENDING=0
+    printf '\nRestoring and verifying all original volumes…\n' >&2
+    while (( SECONDS < deadline )); do
+        disk=$(resolve_disk 2>/dev/null || true)
+        if [[ -n "$disk" ]]; then
+            identity_rc=0
+            bounded 35 "$PYTHON" -I "$VOLUME_GUARD" identity "$disk" "$VOLUME_MANIFEST" || identity_rc=$?
+            if [[ $identity_rc -eq 0 ]]; then ready=1; break; fi
+            if [[ $identity_rc -ne 75 ]]; then
+                printf 'RECOVERY FAILED: identity mismatch or unverifiable inventory; no mount attempted.\n' >&2
+                return 1
+            fi
         fi
-        disk=""
         sleep 1
     done
-    if [[ -n "$disk" ]]; then
-        /usr/sbin/diskutil mountDisk "$disk" >/dev/null 2>&1 || true
-    elif [[ -n "$ACTIVE_DISK" ]]; then
-        /usr/sbin/diskutil mountDisk "$ACTIVE_DISK" >/dev/null 2>&1 || true
-    fi
-    return 0
+    [[ $ready -eq 1 ]] || { printf 'RECOVERY FAILED: volume discovery deadline expired.\n' >&2; return 1; }
+    mutate_disk mountDisk "$disk" ||
+        printf 'Mount request failed; checking actual volume state before declaring recovery.\n' >&2
+    [[ $MUTATION_PENDING -eq 0 ]] || return 1
+    deadline=$((SECONDS + 90))
+    while (( SECONDS < deadline )); do
+        disk=$(resolve_disk 2>/dev/null || true)
+        if [[ -n "$disk" ]] && bounded 45 "$PYTHON" -I "$VOLUME_GUARD" verify "$disk" "$VOLUME_MANIFEST" >/dev/null 2>&1; then
+            printf 'Recovery verified: all volume UUIDs, paths and physical store match.\n' >&2
+            RECOVERY_FAILED=0
+            return 0
+        fi
+        sleep 1
+    done
+    printf 'RECOVERY FAILED: one or more original volumes are missing or mismatched. Stop disk workloads; do not format or force repair.\n' >&2
+    return 1
 }
 
 cleanup() {
     local rc=$?
     trap - EXIT
-    restore_disk
+    trap '' INT TERM HUP
+    # The actual root owner must confirm no child remains before any recovery.
+    if settle_worker; then
+        if ! restore_disk; then rc=70; RECOVERY_FAILED=1; fi
+    else
+        rc=70
+    fi
+    if [[ $RECOVERY_FAILED -eq 1 ]]; then rc=70; fi
+    if [[ $LOCK_HELD -eq 1 && $RECOVERY_FAILED -eq 0 ]]; then rmdir "$ROOT/.capture-lock" 2>/dev/null || true; fi
+    # Critical-phase output stays on internal storage until recovery/lock handling ends.
+    # A stalled reader can delay this best-effort replay by at most its timeout.
+    if [[ -n "$CAPTURE_LOG" ]]; then
+        bounded 2 /bin/cat "$CAPTURE_LOG" >&3 2>&4 || true
+    fi
     exit "$rc"
 }
 
@@ -257,8 +365,8 @@ hash_run() {
         cd "$run_dir"
         : > SHA256SUMS
         for file in identify_controller.bin smart_health_log.bin \
-                    error_info_log.bin enrollment.plist summary.txt probe.log; do
-            [[ -f "$file" ]] && /usr/bin/shasum -a 256 "$file" >> SHA256SUMS
+                    error_info_log.bin enrollment.plist summary.txt probe.log volumes-before.json child-exited release-status.plist unmountDisk-exited mountDisk-exited; do
+            [[ -f "$file" ]] && LC_ALL=C /usr/bin/shasum -a 256 "$file" >> SHA256SUMS
         done
     )
 }
@@ -266,8 +374,7 @@ hash_run() {
 LAST_RUN_DIR=""
 
 perform_capture() {
-    local mode=$1 disk=$2 run_id run_dir probe_rc verified_disk
-    authorize_admin
+    local mode=$1 disk=$2 run_id run_dir probe_rc verified_disk binding
     require_time_machine_idle
     verified_disk=$(resolve_disk)
     [[ "$verified_disk" == "$disk" ]] ||
@@ -275,47 +382,90 @@ perform_capture() {
     verify_mounted_volume "$verified_disk"
     run_id=$(/bin/date '+%Y%m%d_%H%M%S')
     run_dir="$RUNS/$run_id"
-    mkdir -p "$run_dir"
-
-    ACTIVE_DISK=$disk
+    mkdir "$run_dir"  # Refuse timestamp collisions rather than overwrite evidence.
+    LAST_OPERATION_DIR="$run_dir"
+    VOLUME_MANIFEST="$run_dir/volumes-before.json"
+    binding=$(bounded 10 "$BINARY" binding "$disk") || die "cannot bind disk to USB registry entry"
+    [[ "$binding" =~ ^[0-9]+$ ]] || die "invalid USB registry binding"
+    bounded 45 "$PYTHON" -I "$VOLUME_GUARD" snapshot "$disk" "$VOLUME_MANIFEST" "$EXPECTED_VOLUME_UUID"
+    [[ "$(bounded 10 "$BINARY" binding "$disk")" == "$binding" ]] || die "USB binding changed during snapshot"
+    # Redirect BEFORE any unmount. EXIT cleanup inherits these local log descriptors.
+    CAPTURE_LOG="$run_dir/transaction.log"
+    exec 3>&1 4>&2
+    exec >> "$CAPTURE_LOG" 2>&1
+    start_worker "$mode" "$disk" "$binding" "$run_dir"
+    # Authorization can take time; revalidate after the actual worker is ready.
+    [[ "$(resolve_disk)" == "$disk" ]] || die "disk changed during authorization"
+    bounded 45 "$PYTHON" -I "$VOLUME_GUARD" verify "$disk" "$VOLUME_MANIFEST"
+    [[ "$(bounded 10 "$BINARY" binding "$disk")" == "$binding" ]] || die "USB binding changed during authorization"
+    wait_worker ready 2 || die "authorized worker is no longer ready; no unmount attempted"
     NEEDS_RESTORE=1
     trap cleanup EXIT
     trap 'exit 130' INT TERM HUP
 
     printf 'Unmounting %s…\n' "$disk"
-    /usr/sbin/diskutil unmountDisk "$disk" >/dev/null ||
+    mutate_disk unmountDisk "$disk" >/dev/null ||
         die "could not unmount the selected disk"
-    if /sbin/mount | /usr/bin/grep -Fq "on $EXPECTED_MOUNT "; then
-        die "the enrolled volume remained mounted"
-    fi
+    bounded 45 "$PYTHON" -I "$VOLUME_GUARD" unmounted "$disk" "$VOLUME_MANIFEST" ||
+        die "whole-disk unmount could not be verified"
 
     printf 'Reading controller identity and health…\n\n'
-    set +e
-    if [[ "$mode" == "enroll" ]]; then
-        # Logs are opened by the normal user; only USB access is privileged.
-        # shellcheck disable=SC2024
-        run_as_root "$BINARY" enroll "$run_dir" \
-            "$ENROLL_USB_VID" "$ENROLL_USB_PID" \
-            > "$run_dir/summary.txt" 2> "$run_dir/probe.log"
-    else
-        # shellcheck disable=SC2024
-        run_as_root "$BINARY" probe "$run_dir" "$CONFIG_PATH" \
-            > "$run_dir/summary.txt" 2> "$run_dir/probe.log"
+    PROBE_RECEIPT="$run_dir/child-exited"
+    PROBE_PENDING=1
+    : > "$run_dir/probe.request"
+    if ! wait_worker "done" 170; then
+        die "privileged child completion unconfirmed"
     fi
-    probe_rc=$?
-    set -e
+    WORKER_STARTED=0
+    PROBE_PENDING=0  # Worker acknowledgement is stronger than a child receipt file.
+    probe_rc=$("$PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["returncode"])' "$run_dir/worker-done.json")
+    if ! restore_disk; then
+        RECOVERY_FAILED=1
+        die "capture recovery failed; evidence retained, no repair attempted"
+    fi
+    # Receipt proves process exit, not that the native release path ran.
+    if [[ "$(/usr/bin/plutil -extract release_path_completed raw -o - "$run_dir/release-status.plist" 2>/dev/null || true)" == true ]]; then
+        printf 'Native release path completed; all volumes independently verified.\n'
+    else
+        printf 'Native release unconfirmed (forced exit or missing marker); volume recovery independently verified.\n'
+        [[ $probe_rc -ne 0 ]] || probe_rc=1
+    fi
     /bin/cat "$run_dir/probe.log" >&2
     /bin/cat "$run_dir/summary.txt"
 
-    restore_disk
-    wait_for_mounted_volume
-    trap - EXIT INT TERM HUP
-
-    run_as_root /usr/sbin/chown -R "$UID:$(/usr/bin/id -g)" "$run_dir"
     hash_run "$run_dir"
     verify_mounted_volume "$(resolve_disk)"
     [[ $probe_rc -eq 0 ]] || die "probe failed; private evidence was retained"
     LAST_RUN_DIR=$run_dir
+}
+
+verify_final_volumes() {
+    local disk
+    # Preserve the lock if interrupted during the final check or if any volume vanished.
+    RECOVERY_FAILED=1
+    disk=$(resolve_disk) || die "final physical disk verification failed"
+    bounded 45 "$PYTHON" -I "$VOLUME_GUARD" verify "$disk" "$VOLUME_MANIFEST" ||
+        die "final verification failed: all original volumes must still be mounted"
+    RECOVERY_FAILED=0
+}
+
+update_latest() {
+    "$PYTHON" -I - "$ROOT" "runs/${LAST_RUN_DIR##*/}" <<'PYCODE'
+import os, sys
+root, target = sys.argv[1:]
+temporary = os.path.join(root, '.capture-lock', 'latest')
+os.symlink(target, temporary)
+try:
+    os.replace(temporary, os.path.join(root, 'latest'))
+finally:
+    if os.path.lexists(temporary):
+        os.unlink(temporary)
+PYCODE
+}
+
+validate_profile_file() {
+    local CONFIG_PATH=$1
+    load_profile
 }
 
 write_profile() {
@@ -345,6 +495,11 @@ write_profile() {
     /usr/bin/plutil -insert nvme_model -string "$enrolled_nvme_model" "$temp"
     /usr/bin/plutil -insert nvme_serial -string "$enrolled_nvme_serial" "$temp"
     /bin/chmod 600 "$temp"
+    # Validate the candidate before replacing a previously valid enrollment.
+    if ! (validate_profile_file "$temp"); then
+        /bin/rm -f "$temp"
+        die "invalid enrollment result; previous device profile preserved"
+    fi
     /bin/mv -f "$temp" "$CONFIG_PATH"
 }
 
@@ -353,14 +508,14 @@ show_setup_candidates() {
     printf '\nConnected external physical USB disks:\n'
     while read -r candidate _; do
         [[ "$candidate" =~ ^/dev/disk[0-9]+$ ]] || continue
-        info=$(/usr/sbin/diskutil info -plist "$candidate" 2>/dev/null) || continue
+        info=$(diskutil info -plist "$candidate" 2>/dev/null) || continue
         protocol=$(plist_stdin_value "$info" BusProtocol 2>/dev/null || true)
         whole=$(plist_stdin_value "$info" WholeDisk 2>/dev/null || true)
         [[ "$protocol" == "USB" && "$whole" == "true" ]] || continue
         media=$(plist_stdin_value "$info" MediaName 2>/dev/null || true)
         size=$(plist_stdin_value "$info" IOKitSize 2>/dev/null || true)
         printf '  %-12s  %-28s  %s bytes\n' "$candidate" "$media" "$size"
-    done < <(/usr/sbin/diskutil list external physical)
+    done < <(diskutil list external physical)
     printf '\n'
 }
 
@@ -412,7 +567,7 @@ run_setup() {
     fi
     [[ "$disk" =~ ^/dev/disk[0-9]+$ ]] || die "invalid physical disk path"
 
-    info=$(/usr/sbin/diskutil info -plist "$disk") ||
+    info=$(diskutil info -plist "$disk") ||
         die "selected disk is unavailable"
     protocol=$(plist_stdin_value "$info" BusProtocol 2>/dev/null || true)
     whole=$(plist_stdin_value "$info" WholeDisk 2>/dev/null || true)
@@ -426,7 +581,7 @@ run_setup() {
     [[ "$size" =~ ^[0-9]+$ && "$size" -gt 0 ]] ||
         die "selected disk has an invalid size"
 
-    volume_info=$(/usr/sbin/diskutil info -plist "$volume") ||
+    volume_info=$(diskutil info -plist "$volume") ||
         die "selected volume is unavailable"
     mount=$(plist_stdin_value "$volume_info" MountPoint 2>/dev/null || true)
     volume_uuid=$(plist_stdin_value "$volume_info" VolumeUUID 2>/dev/null || true)
@@ -456,6 +611,7 @@ run_setup() {
         [[ "$answer" == "ENROLL" ]] || die "cancelled"
     fi
 
+    mkdir -p "$RUNS"
     build_if_needed
     perform_capture enroll "$disk"
     [[ -f "$LAST_RUN_DIR/enrollment.plist" ]] ||
@@ -463,7 +619,8 @@ run_setup() {
     write_profile "$LAST_RUN_DIR/enrollment.plist"
     load_profile
     verify_mounted_volume "$(resolve_disk)"
-    ln -sfn "runs/${LAST_RUN_DIR##*/}" "$ROOT/latest"
+    verify_final_volumes
+    update_latest
 
     printf '\n✓ Enrollment and baseline health read complete\n'
     printf '  Local profile: config/device.plist (gitignored, mode 600)\n'
@@ -486,14 +643,16 @@ run_probe() {
     verify_mounted_volume "$disk"
     build_if_needed
 
-    printf '\nThis will briefly unmount the enrolled volume, read three NVMe pages, and remount it.\n'
+    printf '\nThis will briefly unmount the whole enrolled disk, read three NVMe pages, and verify all original volumes.\n'
     if [[ $preconfirmed -eq 0 ]]; then
         read -r -p 'Type PROBE to continue: ' answer
         [[ "$answer" == "PROBE" ]] || die "cancelled"
     fi
 
+    mkdir -p "$RUNS"
     perform_capture probe "$disk"
-    ln -sfn "runs/${LAST_RUN_DIR##*/}" "$ROOT/latest"
+    verify_final_volumes
+    update_latest
     printf '\n✓ Health read complete\n  runs/%s\n\n' "${LAST_RUN_DIR##*/}"
 }
 
@@ -505,13 +664,13 @@ usage() {
     printf '\nAutomation:\n'
     printf '  setup --disk /dev/diskN --volume /Volumes/Name --confirm\n'
     printf '  probe --confirm\n'
-    printf '  Non-interactive runs use a macOS authorization dialog; credentials are not logged.\n'
+    printf '  Captures use a macOS authorization dialog; credentials are not logged.\n'
 }
 
 case "${1:-status}" in
-    setup) run_setup "${@:2}" ;;
-    status) load_profile; show_status ;;
-    probe) load_profile; run_probe "${@:2}" ;;
+    setup) capture_preflight; run_setup "${@:2}" ;;
+    status) PYTHON=$(command -v python3); load_profile; show_status ;;
+    probe) capture_preflight; load_profile; run_probe "${@:2}" ;;
     -h|--help|help) usage ;;
     *) usage >&2; exit 2 ;;
 esac

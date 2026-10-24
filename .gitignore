@@ -16,3 +16,8 @@ latest
 *.tmp
 *.swp
 *~
+
+# Local capture lock and Python caches
+.capture-lock/
+__pycache__/
+*.pyc

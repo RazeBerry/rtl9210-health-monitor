@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include "cancellation.h"
 
 #pragma pack(push, 1)
 typedef struct {
@@ -48,6 +49,43 @@ typedef struct {
     char nvme_serial[21];
 } identity_t;
 
+/* Validate the complete configuration before changing USB configuration.
+ * This adapter deliberately supports only the reviewed interface-0 BOT layout.
+ * No endpoint guesses are made for other firmware layouts. */
+static bool validate_bot_layout(const IOUSBConfigurationDescriptor *config)
+{
+    if (!config) return false;
+    const uint8_t *b = (const uint8_t *)config;
+    size_t total = (size_t)b[2] | ((size_t)b[3] << 8);
+    if (b[0] < 9 || b[1] != 2 || total < b[0] || total > 4096 || b[5] != 1)
+        return false;
+    bool bot = false, in = false, out = false;
+    unsigned matches = 0, endpoints = 0;
+    for (size_t pos = b[0]; pos < total;) {
+        if (total - pos < 2 || b[pos] < 2 || b[pos] > total - pos) return false;
+        const uint8_t *d = b + pos;
+        if (d[1] == 4) {
+            if (bot && (!in || !out || endpoints != 2)) return false;
+            if (d[0] < 9) return false;
+            bot = d[2] == 0 && d[3] == 0;
+            if (bot) {
+                if (++matches != 1 || d[4] != 2 || d[5] != 8 ||
+                    d[6] != 6 || d[7] != 0x50) return false;
+                in = out = false;
+                endpoints = 0;
+            }
+        } else if (d[1] == 5 && bot) {
+            if (d[0] < 7 || (d[3] & 3) != 2 || !(d[4] | d[5])) return false;
+            endpoints++;
+            if (d[2] == 0x81 && !in) in = true;
+            else if (d[2] == 0x02 && !out) out = true;
+            else return false;
+        }
+        pos += d[0];
+    }
+    return matches == 1 && in && out && endpoints == 2;
+}
+
 static IOUSBHostInterface *g_intf = nil;
 static IOUSBHostPipe *g_in = nil;
 static IOUSBHostPipe *g_out = nil;
@@ -56,6 +94,7 @@ static uint32_t g_tag = 0x554e4300; /* 'UNC\0' */
 static int bot_command_in(const uint8_t *cdb, uint8_t cdb_len, uint8_t *buf,
                           uint32_t data_len)
 {
+    if (rtl_cancel_signal) return -6;
     cbw_t cbw;
     memset(&cbw, 0, sizeof cbw);
     cbw.sig = 0x43425355u;
@@ -78,6 +117,7 @@ static int bot_command_in(const uint8_t *cdb, uint8_t cdb_len, uint8_t *buf,
         return -1;
     }
 
+    if (rtl_cancel_signal) return -6;
     NSUInteger data_got = 0;
     if (data_len) {
         NSMutableData *data = [NSMutableData dataWithLength:data_len];
@@ -87,6 +127,7 @@ static int bot_command_in(const uint8_t *cdb, uint8_t cdb_len, uint8_t *buf,
                        completionTimeout:8.0
                                    error:&err]) {
             fprintf(stderr, "  data-in transfer failed\n");
+            if (rtl_cancel_signal) return -6;
             NSError *clear_error = nil;
             [g_in clearStallWithError:&clear_error];
             return -2;
@@ -99,6 +140,7 @@ static int bot_command_in(const uint8_t *cdb, uint8_t cdb_len, uint8_t *buf,
         memcpy(buf, data.bytes, data_len);
     }
 
+    if (rtl_cancel_signal) return -6;
     NSMutableData *csw_data = [NSMutableData dataWithLength:13];
     NSUInteger csw_got = 0;
     err = nil;
@@ -106,6 +148,7 @@ static int bot_command_in(const uint8_t *cdb, uint8_t cdb_len, uint8_t *buf,
                     bytesTransferred:&csw_got
                    completionTimeout:8.0
                                error:&err]) {
+        if (rtl_cancel_signal) return -6;
         NSError *clear_error = nil;
         [g_in clearStallWithError:&clear_error];
         err = nil;
@@ -278,6 +321,29 @@ static bool usb_number_u16(io_service_t service, CFStringRef key,
     return true;
 }
 
+// Resolve a whole BSD disk to its actual USB ancestor, never by product name.
+static uint64_t disk_usb_id(const char *disk)
+{
+    if (strncmp(disk, "/dev/disk", 9) != 0 || !disk[9]) return 0;
+    for (const char *p = disk + 9; *p; ++p)
+        if (*p < '0' || *p > '9') return 0;
+    io_service_t node = IOServiceGetMatchingService(kIOMainPortDefault,
+        IOBSDNameMatching(kIOMainPortDefault, 0, disk + 5));
+    while (node) {
+        if (IOObjectConformsTo(node, "IOUSBHostDevice")) {
+            uint64_t value = 0;
+            IORegistryEntryGetRegistryEntryID(node, &value);
+            IOObjectRelease(node);
+            return value;
+        }
+        io_registry_entry_t parent = IO_OBJECT_NULL;
+        kern_return_t result = IORegistryEntryGetParentEntry(node, kIOServicePlane, &parent);
+        IOObjectRelease(node);
+        node = result == KERN_SUCCESS ? parent : IO_OBJECT_NULL;
+    }
+    return 0;
+}
+
 static io_service_t find_exact_rtl(const identity_t *identity, bool enrolling)
 {
     CFMutableDictionaryRef match = [IOUSBHostDevice
@@ -346,8 +412,10 @@ static IOUSBHostInterface *open_interface(io_service_t device_service,
                                           dispatch_queue_t queue)
 {
     for (int attempt = 1; attempt <= 10; attempt++) {
+        if (rtl_cancel_signal) return nil;
         mach_timespec_t wait = {2, 0};
         IOServiceWaitQuiet(device_service, &wait);
+        if (rtl_cancel_signal) return nil;
         io_iterator_t iterator = IO_OBJECT_NULL;
         if (IORegistryEntryGetChildIterator(device_service, kIOServicePlane,
                                             &iterator) != KERN_SUCCESS) {
@@ -408,8 +476,14 @@ static IOUSBHostInterface *open_interface(io_service_t device_service,
 
 int main(int argc, char **argv)
 {
-    bool enrolling = argc == 5 && strcmp(argv[1], "enroll") == 0;
-    bool probing = argc == 4 && strcmp(argv[1], "probe") == 0;
+    if (argc == 3 && strcmp(argv[1], "binding") == 0) {
+        uint64_t value = disk_usb_id(argv[2]);
+        if (!value) return 1;
+        printf("%" PRIu64 "\n", value);
+        return 0;
+    }
+    bool enrolling = argc == 7 && strcmp(argv[1], "enroll") == 0;
+    bool probing = argc == 6 && strcmp(argv[1], "probe") == 0;
     if (!enrolling && !probing) {
         fprintf(stderr, "FATAL: run through the rtl9210-health front door\n");
         return 2;
@@ -419,6 +493,13 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    if (rtl_install_cancellation() != 0) return 2;
+    const char *selected_disk = argv[argc - 2];
+    const char *id_text = argv[argc - 1];
+    char *end = NULL;
+    errno = 0;
+    uint64_t expected_id = strtoull(id_text, &end, 10);
+    if (errno || !expected_id || !*id_text || *end || *id_text == '-') return 2;
     const char *outdir = argv[2];
     identity_t identity = {0};
     if (enrolling) {
@@ -441,6 +522,7 @@ int main(int argc, char **argv)
         IOUSBHostDevice *device = nil;
         NSError *error = nil;
         int rc = 1;
+        bool captured = false;
         bool have_identify = false;
         bool have_smart = false;
         bool have_error_log = false;
@@ -450,6 +532,7 @@ int main(int argc, char **argv)
         static uint8_t smart[512];
         static uint8_t error_log[512];
 
+        if (rtl_cancel_signal) goto done;
         service = find_exact_rtl(&identity, enrolling);
         if (!service) {
             fprintf(stderr, "FATAL: configured RTL9210 bridge unavailable\n");
@@ -465,6 +548,13 @@ int main(int argc, char **argv)
             goto done;
         }
 
+        uint64_t selected_id = 0;
+        if (IORegistryEntryGetRegistryEntryID(service, &selected_id) != KERN_SUCCESS ||
+            selected_id != expected_id || disk_usb_id(selected_disk) != expected_id) {
+            fprintf(stderr, "FATAL: selected disk/USB registry binding changed; refusing capture\n");
+            goto done;
+        }
+        if (rtl_cancel_signal) goto done;
         device = [[IOUSBHostDevice alloc]
             initWithIOService:service
                       options:IOUSBHostObjectInitOptionsDeviceCapture
@@ -475,8 +565,19 @@ int main(int argc, char **argv)
             fprintf(stderr, "FATAL: USB device capture failed\n");
             goto done;
         }
+        captured = true;
+        if (rtl_cancel_signal) goto done;
         fprintf(stderr, "capture OK\n");
 
+        const IOUSBConfigurationDescriptor *layout =
+            [device configurationDescriptorWithConfigurationValue:1 error:&error];
+        if (!validate_bot_layout(layout)) {
+            fprintf(stderr, "FATAL: unsupported or malformed BOT descriptors; no vendor commands sent\n");
+            goto done;
+        }
+        fprintf(stderr, "validated configuration 1, interface 0/BOT, bulk IN 0x81 OUT 0x02\n");
+
+        if (rtl_cancel_signal) goto done;
         BOOL unconfigured =
             [device configureWithValue:0 matchInterfaces:NO error:&error];
         fprintf(stderr, "configureWithValue(0) -> %s\n",
@@ -488,6 +589,7 @@ int main(int argc, char **argv)
         mach_timespec_t wait = {2, 0};
         IOServiceWaitQuiet([device ioService], &wait);
 
+        if (rtl_cancel_signal) goto done;
         BOOL configured =
             [device configureWithValue:1 matchInterfaces:NO error:&error];
         fprintf(stderr,
@@ -496,6 +598,7 @@ int main(int argc, char **argv)
         if (!configured)
             goto done;
 
+        if (rtl_cancel_signal) goto done;
         g_intf = open_interface([device ioService], queue);
         if (!g_intf) {
             fprintf(stderr, "FATAL: could not open interface 0\n");
@@ -503,12 +606,21 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "interface OPEN\n");
 
+        if (rtl_cancel_signal) goto done;
         error = nil;
         if (![g_intf selectAlternateSetting:0 error:&error]) {
             fprintf(stderr, "FATAL: could not select BOT alternate setting\n");
             goto done;
         }
 
+        if (rtl_cancel_signal) goto done;
+        const IOUSBInterfaceDescriptor *active = g_intf.interfaceDescriptor;
+        if (!active || active->bInterfaceNumber != 0 || active->bAlternateSetting != 0 ||
+            active->bInterfaceClass != 8 || active->bInterfaceSubClass != 6 ||
+            active->bInterfaceProtocol != 0x50 || active->bNumEndpoints != 2) {
+            fprintf(stderr, "FATAL: active interface is not the validated BOT interface\n");
+            goto done;
+        }
         error = nil;
         g_in = [g_intf copyPipeWithAddress:0x81 error:&error];
         error = nil;
@@ -609,8 +721,23 @@ int main(int argc, char **argv)
         printf("\nError Information Log: %s\n",
                nonzero_error_log
                    ? "nonzero entries present (see private raw log)"
-                   : "all zero (no logged errors)");
+                   : "first 512 bytes are zero; not a complete lifetime error history");
 
+        /* 512 bytes cover at most eight 64-byte error records, not all entries
+         * supported by a controller. Status codes require NVMe interpretation;
+         * a nonzero entry alone is not evidence of failed NAND. */
+        printf("  Captured error records: first 8 only (512 bytes)\n");
+        for (size_t n = 0; n < sizeof error_log / 64; n++) {
+            const uint8_t *entry = error_log + n * 64;
+            uint64_t count = le64_lo(entry);
+            if (!count) continue;
+            unsigned status = entry[12] | ((unsigned)entry[13] << 8);
+            unsigned sqid = entry[8] | ((unsigned)entry[9] << 8);
+            printf("  entry %zu: count=%" PRIu64 " sqid=%u status_raw=0x%04x lba=%" PRIu64 "\n",
+                   n, count, sqid, status, le64_lo(entry + 16));
+        }
+
+        if (rtl_cancel_signal) goto done;
         if (enrolling && !write_enrollment(outdir, &identity)) {
             fprintf(stderr, "FATAL: could not save private enrollment profile\n");
             goto done;
@@ -628,11 +755,21 @@ done:
             [device destroy];
             device = nil;
             fprintf(stderr,
-                    "\n[restore] device reset + drivers re-registered\n");
+                    "\n[restore] capture released; reset/rematch requested, volume recovery NOT yet verified\n");
         }
         if (service)
             IOObjectRelease(service);
 
+        // Written only after destroy calls returned; not proof of physical recovery.
+        NSDictionary *release_status = @{
+            @"release_path_completed": @YES,
+            @"capture_acquired": @(captured),
+            @"cancel_signal": @((int)rtl_cancel_signal)
+        };
+        NSString *release_path = [[NSString stringWithUTF8String:outdir]
+            stringByAppendingPathComponent:@"release-status.plist"];
+        if (![release_status writeToFile:release_path atomically:YES]) rc = 1;
+        if (rtl_cancel_signal) rc = 128 + rtl_cancel_signal;
         printf("\nprobe result: identify=%s smart=%s error_log=%s\n",
                have_identify ? "OK" : "FAILED",
                have_smart ? "OK" : "FAILED",
